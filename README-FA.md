@@ -1,24 +1,22 @@
-# وب‌پروکسی شخصی روی Railway
+# مرورگر Railway با چند تب و S3
 
-این پروژه یک **Web Proxy تحت وب** شبیه CroxyProxy است؛ نه V2Ray و نه مرورگر مجازی. کاربر URL را در پنل وارد می‌کند و سرور Railway صفحه، منابع، فرم‌ها، Redirect، Cookie و WebSocket را از مقصد دریافت می‌کند.
+این پروژه نسخه توسعه‌یافته مرورگر راه‌دور Railway است. Chromium واقعی روی Railway اجرا می‌شود، تصویر تب فعال با CDP Screencast به رابط وب فرستاده می‌شود و ورودی موس و صفحه‌کلید از مرورگر کاربر به Chromium منتقل می‌شود.
 
-## قابلیت‌ها
+## قابلیت‌های جدید
 
-- رابط کاملاً تحت وب برای دسکتاپ و موبایل
-- دریافت سایت‌ها با IP خروجی Railway
-- بازنویسی لینک‌های HTML، CSS، فرم‌ها، iframe، srcset و Redirect
-- Shim مرورگر برای `fetch`، XHR، WebSocket، EventSource و محتوای پویا
-- عبور POST و Range برای فرم و رسانه
-- Cookie Jar سمت سرور با ذخیره روی Railway Volume
-- ورود محافظت‌شده با `ACCESS_TOKEN`
-- جلوگیری از Open Proxy و مسدودسازی localhost و شبکه خصوصی
-- نمایش IP خروجی جاری Railway
+- مدیریت چند تب: ایجاد، فعال‌سازی، بستن و نگهداری وضعیت هر تب
+- Popupهای سایت به‌صورت تب جدید
+- نوار تب واکنش‌گرا برای دسکتاپ و موبایل
+- دریافت فایل توسط Chromium
+- انتقال خودکار فایل دانلودشده به هر Bucket سازگار با S3
+- فهرست دانلودها، دریافت با Signed URL و حذف Object از Bucket
+- نگهداری موقت محلی روی Railway Volume در صورت تنظیم‌نبودن S3
 
 ## Deploy روی Railway
 
-1. فایل ZIP را باز و محتویات را در یک GitHub Repository قرار بده.
+1. محتویات ZIP را در GitHub Repository قرار بده.
 2. در Railway گزینه **Deploy from GitHub Repo** را انتخاب کن.
-3. در Variables این Secret را اضافه کن:
+3. این Variable اجباری را اضافه کن:
 
 ```dotenv
 ACCESS_TOKEN=یک-رمز-طولانی-و-تصادفی
@@ -31,65 +29,104 @@ ACCESS_TOKEN=یک-رمز-طولانی-و-تصادفی
 ```
 
 5. در Networking یک Railway Domain یا Custom Domain ایجاد کن.
-6. سرویس را با یک Replica اجرا کن؛ برای این نسخه 512MB RAM معمولاً کافی است.
+6. سرویس را با **یک Replica** اجرا کن؛ تب‌ها و پروفایل Chromium برای یک نشست مشترک طراحی شده‌اند.
 
-## متغیرهای اختیاری
+## تنظیم S3-compatible Bucket
+
+متغیرهای زیر را در Railway اضافه کن:
+
+```dotenv
+S3_ENDPOINT=https://YOUR-S3-ENDPOINT
+S3_REGION=auto
+S3_BUCKET=browser-downloads
+S3_ACCESS_KEY_ID=YOUR_ACCESS_KEY
+S3_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
+S3_FORCE_PATH_STYLE=true
+S3_PREFIX=browser-downloads
+S3_SIGNED_URL_TTL=900
+```
+
+### Cloudflare R2
+
+```dotenv
+S3_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+S3_REGION=auto
+S3_FORCE_PATH_STYLE=true
+```
+
+### AWS S3
+
+برای AWS اصلی می‌توانی `S3_ENDPOINT` را حذف کنی و Region واقعی را قرار بدهی:
+
+```dotenv
+S3_REGION=eu-central-1
+S3_FORCE_PATH_STYLE=false
+```
+
+همین تنظیمات با سرویس‌هایی مثل MinIO، Backblaze B2 S3 API، Wasabi و DigitalOcean Spaces نیز قابل استفاده است.
+
+## جریان دانلود
+
+1. Chromium فایل را در مسیر موقت `/data/downloads` دریافت می‌کند.
+2. فایل با اندازه و Content-Type صحیح داخل Bucket آپلود می‌شود.
+3. بعد از آپلود موفق، نسخه محلی حذف می‌شود.
+4. اطلاعات دانلود در `/data/download-index.json` نگهداری می‌شود.
+5. دکمه دریافت یک Signed URL موقت تولید می‌کند.
+6. حذف فایل، Object را از Bucket هم حذف می‌کند.
+
+اگر S3 تنظیم نشده باشد، فایل روی Railway Volume باقی می‌ماند و از همان پنل قابل دریافت است.
+
+## سایر متغیرها
 
 ```dotenv
 PORT=3000
+PROFILE_DIR=/data/chromium-profile
 DATA_DIR=/data
+HOME_URL=https://example.com
+BROWSER_LOCALE=fa-IR
+BROWSER_TIMEZONE=Asia/Tehran
+SCREEN_QUALITY=72
+S3_SIGNED_URL_TTL=900
 ```
 
-`ALLOW_PRIVATE_TEST=true` فقط برای تست محلی است و در Railway نباید فعال شود.
+برای تست محلی روی HTTP:
+
+```dotenv
+SECURE_COOKIE=false
+CHROMIUM_PATH=/usr/bin/chromium
+```
+
+در Railway مقدار پیش‌فرض `SECURE_COOKIE=true` را تغییر نده. متغیر `ALLOW_PRIVATE_TEST=true` فقط در تست خودکار با یک سایت محلی استفاده می‌شود و نباید روی Railway فعال شود.
 
 ## IP خروجی
 
-سایت مقصد IP خروجی سرویس Railway را می‌بیند. بدون Static Outbound IP ممکن است IP پس از Redeploy یا تغییر Region عوض شود. در پلن Pro می‌توان Static Outbound IPs را فعال و سرویس را Redeploy کرد. Railway ممکن است در حالت HA چند IP خروجی داشته باشد.
-
-دکمه **Railway egress** در رابط، IP خروجی فعلی را نمایش می‌دهد.
-
-## Cookie و Login
-
-Cookieهای مقصد به مرورگر کاربر داده نمی‌شوند؛ داخل Cookie Jar سرور ذخیره شده و برای دامنه و مسیر صحیح به مقصد فرستاده می‌شوند. فایل Cookie Jar روی Volume قرار می‌گیرد:
-
-```text
-/data/proxy-cookie-jar.json
-```
-
-این فایل ممکن است شامل نشست ورود سایت‌ها باشد و باید خصوصی بماند.
-
-## محدودیت‌های واقعی Web Proxy
-
-این پروژه نسبت به یک Reverse Proxy ساده سازگاری بیشتری دارد، اما هیچ Web Proxy عمومی نمی‌تواند اجرای همه سایت‌ها را تضمین کند. موارد زیر ممکن است محدود یا خراب شوند:
-
-- DRM و پخش محافظت‌شده
-- Passkey و WebAuthn وابسته به Origin
-- CAPTCHA و تشخیص دیتاسنتر
-- برنامه‌هایی که JavaScript را بر اساس `location.origin` امضا می‌کنند
-- Service Workerهای مقصد
-- Loginهایی که دامنه Proxy را تشخیص می‌دهند
-
-برای سایت‌های معمولی، فرم، Cookie، Redirect و Login سنتی پشتیبانی می‌شود. این پروژه کنترل‌های امنیتی یا ضدربات سایت مقصد را دور نمی‌زند.
+سایت‌ها IP خروجی خود Railway را مشاهده می‌کنند. در صورت نیاز به IP پایدارتر، Static Outbound IPs را در Railway فعال و سرویس را Redeploy کن.
 
 ## امنیت
 
 - سرویس بدون `ACCESS_TOKEN` قابل استفاده نیست.
-- مقصدهای خصوصی، localhost و دامنه‌های داخلی مسدودند.
-- از انتشار عمومی توکن خودداری کن.
-- پروژه برای استفاده شخصی و یک Cookie Jar مشترک طراحی شده است.
-- فقط برای دسترسی قانونی و مطابق قوانین و شرایط سایت مقصد استفاده کن.
+- کلیدهای S3 فقط در Railway Variables قرار می‌گیرند و به مرورگر کاربر ارسال نمی‌شوند.
+- دریافت فایل با Signed URL موقت انجام می‌شود.
+- دسترسی مستقیم به localhost، شبکه خصوصی و Metadata endpointهای شناخته‌شده مسدود است.
+- فایل `download-index.json` شامل کلید Object است اما شامل Secretهای S3 نیست.
+- Bucket را Private نگه دار.
+
+## محدودیت‌ها
+
+- این نسخه برای یک کاربر یا یک نشست مشترک و یک Replica ساخته شده است.
+- CAPTCHA، Passkey/WebAuthn، DRM و تشخیص دیتاسنتر ممکن است محدودیت داشته باشند.
+- در حالت HA یا چند Replica باید State تب‌ها، دانلودها و Profile بین Replicaها هماهنگ شود.
 
 ## اجرای محلی
 
 ```bash
 npm install
-ACCESS_TOKEN='یک-رمز-طولانی' DATA_DIR='./data' npm start
-```
-
-برای تست مقصد محلی فقط در محیط توسعه:
-
-```bash
-ALLOW_PRIVATE_TEST=true ACCESS_TOKEN='یک-رمز-طولانی' DATA_DIR='./data' npm start
+ACCESS_TOKEN='test-token-long-enough' \
+SECURE_COOKIE=false \
+CHROMIUM_PATH=/usr/bin/chromium \
+PROFILE_DIR=./data/profile \
+DATA_DIR=./data \
+npm start
 ```
 
 ## Health Check

@@ -1,117 +1,132 @@
 import http from 'node:http';
-import {createHmac,timingSafeEqual} from 'node:crypto';
-import {mkdir,readFile,writeFile,rename} from 'node:fs/promises';
+import {createHmac,randomUUID,timingSafeEqual} from 'node:crypto';
+import {createReadStream} from 'node:fs';
+import {mkdir,readFile,rename,stat,unlink,writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
-import {Readable} from 'node:stream';
-import {lookup} from 'node:dns/promises';
+import net from 'node:net';
+import {chromium} from 'playwright-core';
 import WebSocket,{WebSocketServer} from 'ws';
 
 const PORT=Number(process.env.PORT||3000);
-const TOKEN=String(process.env.ACCESS_TOKEN||'');
+const ACCESS_TOKEN=String(process.env.ACCESS_TOKEN||'');
+const PROFILE_DIR=String(process.env.PROFILE_DIR||'/data/chromium-profile');
 const DATA_DIR=String(process.env.DATA_DIR||'/data');
-const COOKIE_FILE=DATA_DIR+'/proxy-cookie-jar.json';
-const INDEX=fileURLToPath(new URL('./public/index.html',import.meta.url));
-const AUTH_COOKIE='__Host-railway_web_proxy';
+const HOME_URL=String(process.env.HOME_URL||'https://example.com');
+const SCREEN_QUALITY=Math.max(30,Math.min(90,Number(process.env.SCREEN_QUALITY||72)));
+const BROWSER_LOCALE=String(process.env.BROWSER_LOCALE||'fa-IR');
+const BROWSER_TIMEZONE=String(process.env.BROWSER_TIMEZONE||'Asia/Tehran');
+const AUTH_COOKIE='__Host-railway_browser';
+const SECURE_COOKIE=String(process.env.SECURE_COOKIE??'true').toLowerCase()!=='false';
 const ALLOW_PRIVATE_TEST=String(process.env.ALLOW_PRIVATE_TEST||'').toLowerCase()==='true';
-const MAX_BODY=25*1024*1024;
-const DROP_REQUEST=new Set(['host','cookie','authorization','proxy-authorization','connection','content-length','accept-encoding','cf-connecting-ip','x-forwarded-for','x-forwarded-host','x-forwarded-proto','true-client-ip']);
-const DROP_RESPONSE=new Set(['set-cookie','content-length','content-encoding','transfer-encoding','connection','content-security-policy','content-security-policy-report-only','x-frame-options','cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy','permissions-policy','strict-transport-security']);
+const INDEX_PATH=fileURLToPath(new URL('./public/index.html',import.meta.url));
+const DOWNLOAD_INDEX=DATA_DIR+'/download-index.json';
+const DOWNLOAD_DIR=DATA_DIR+'/downloads';
 
-const authHash=()=>createHmac('sha256',TOKEN).update('railway-web-proxy:v1').digest('base64url');
-const safeEqual=(a,b)=>{a=Buffer.from(String(a));b=Buffer.from(String(b));return a.length===b.length&&timingSafeEqual(a,b)};
-const parseCookies=req=>Object.fromEntries(String(req.headers.cookie||'').split(';').map(x=>x.trim().split(/=(.*)/s)).filter(x=>x[0]).map(([k,v=''])=>[k,decodeURIComponent(v)]));
-const authed=req=>Boolean(TOKEN&&safeEqual(parseCookies(req)[AUTH_COOKIE]||'',authHash()));
-const base=req=>'http:'+'//'+(req.headers.host||'localhost');
-const json=(res,status,payload,headers={})=>{const b=JSON.stringify(payload);res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','content-length':Buffer.byteLength(b),...headers});res.end(b)};
-const securityHeaders={'cache-control':'no-store','content-security-policy':"default-src 'self'; img-src 'self' data: blob:; frame-src 'self'; connect-src 'self' ws: wss:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",'referrer-policy':'no-referrer','x-content-type-options':'nosniff','x-frame-options':'DENY'};
+const json=(res,status,value,headers={})=>{const body=JSON.stringify(value);res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','content-length':Buffer.byteLength(body),...headers});res.end(body)};
+const readBody=async(req,limit=1024*1024)=>{const chunks=[];let size=0;for await(const c of req){size+=c.length;if(size>limit)throw Error('Request is too large');chunks.push(c)}return Buffer.concat(chunks)};
+const parseCookies=req=>Object.fromEntries(String(req.headers.cookie||'').split(';').map(v=>v.trim().split(/=(.*)/s)).filter(v=>v[0]).map(([k,v=''])=>[k,decodeURIComponent(v)]));
+const sessionValue=()=>createHmac('sha256',ACCESS_TOKEN).update('railway-browser:v2').digest('base64url');
+const safeEqual=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));return x.length===y.length&&timingSafeEqual(x,y)};
+const authenticated=req=>Boolean(ACCESS_TOKEN&&safeEqual(parseCookies(req)[AUTH_COOKIE]||'',sessionValue()));
+const cookie=(value,maxAge)=>AUTH_COOKIE+'='+encodeURIComponent(value)+'; Path=/; HttpOnly; '+(SECURE_COOKIE?'Secure; ':'')+'SameSite=Strict; Max-Age='+maxAge;
+const requestBase=req=>'http:'+'//'+(req.headers.host||'localhost');
+const publicHeaders={'cache-control':'no-store','content-security-policy':"default-src 'self'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",'referrer-policy':'no-referrer','x-content-type-options':'nosniff','x-frame-options':'DENY'};
 
-async function readBody(req,limit=MAX_BODY){const chunks=[];let size=0;for await(const c of req){size+=c.length;if(size>limit)throw Error('Request body too large');chunks.push(c)}return Buffer.concat(chunks)}
-function splitSetCookie(value=''){return value.split(/,(?=\s*[^;,\s]+=)/g).map(x=>x.trim()).filter(Boolean)}
-function defaultPath(pathname){if(!pathname||!pathname.startsWith('/')||pathname==='/')return'/';return pathname.slice(0,pathname.lastIndexOf('/')+1)||'/'}
-function domainMatch(host,domain,hostOnly){host=host.toLowerCase();domain=domain.toLowerCase();return hostOnly?host===domain:host===domain||host.endsWith('.'+domain)}
-function pathMatch(pathname,cookiePath){return pathname===cookiePath||pathname.startsWith(cookiePath.endsWith('/')?cookiePath:cookiePath+'/')}
+function safeName(name){return String(name||'download').normalize('NFKC').replace(/[\\/:*?"<>|\u0000-\u001f]/g,'_').replace(/^\.+/,'').slice(0,180)||'download'}
+function contentType(name){const ext=name.toLowerCase().split('.').pop();return({pdf:'application/pdf',zip:'application/zip',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',mp4:'video/mp4',mp3:'audio/mpeg',txt:'text/plain; charset=utf-8',json:'application/json',csv:'text/csv; charset=utf-8',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'})[ext]||'application/octet-stream'}
 
-class CookieJar{
-  map=new Map();saveTimer=null;
-  async load(){await mkdir(DATA_DIR,{recursive:true});try{const data=JSON.parse(await readFile(COOKIE_FILE,'utf8'));for(const c of data)if(c&&c.name)this.map.set(this.key(c),c)}catch{}}
-  key(c){return c.domain+'|'+c.path+'|'+c.name}
-  set(header,target,fromDocument=false){
-    const parts=String(header||'').split(';').map(x=>x.trim()).filter(Boolean);if(!parts.length)return;
-    const first=parts.shift(),eq=first.indexOf('=');if(eq<=0)return;
-    const now=Date.now(),c={name:first.slice(0,eq).trim(),value:first.slice(eq+1),domain:target.hostname.toLowerCase(),path:defaultPath(target.pathname),hostOnly:true,secure:false,httpOnly:false,sameSite:'',expires:null,created:now};
-    for(const p of parts){const [raw,...rest]=p.split('=');const k=raw.toLowerCase(),v=rest.join('=');if(k==='domain'){const d=v.replace(/^\./,'').toLowerCase();if(!domainMatch(target.hostname,d,false))return;c.domain=d;c.hostOnly=false}else if(k==='path'&&v.startsWith('/'))c.path=v;else if(k==='secure')c.secure=true;else if(k==='httponly'&&!fromDocument)c.httpOnly=true;else if(k==='samesite')c.sameSite=v;else if(k==='expires'){const t=Date.parse(v);if(Number.isFinite(t))c.expires=t}else if(k==='max-age'){const n=Number(v);if(Number.isFinite(n))c.expires=now+n*1000}}
-    const key=this.key(c);if(c.expires!==null&&c.expires<=now)this.map.delete(key);else this.map.set(key,c);if(this.map.size>1500){const oldest=[...this.map.entries()].sort((a,b)=>a[1].created-b[1].created).slice(0,200);for(const [k]of oldest)this.map.delete(k)}this.schedule();
+class DownloadStore{
+  constructor(onChange){this.onChange=onChange;this.records=[];this.client=null;this.s3=null;this.signer=null;this.configured=false;this.prefix=String(process.env.S3_PREFIX||'browser-downloads/').replace(/^\/+|\/+$/g,'');if(this.prefix)this.prefix+='/' }
+  async init(){await mkdir(DOWNLOAD_DIR,{recursive:true});try{const saved=JSON.parse(await readFile(DOWNLOAD_INDEX,'utf8'));if(Array.isArray(saved))this.records=saved.slice(0,500)}catch{}
+    const required=['S3_BUCKET','S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY'];this.configured=required.every(k=>String(process.env[k]||''));if(!this.configured)return;
+    const mod=await import('@aws-sdk/client-s3'),presigner=await import('@aws-sdk/s3-request-presigner');this.s3=mod;this.signer=presigner.getSignedUrl;
+    const cfg={region:String(process.env.S3_REGION||'auto'),credentials:{accessKeyId:String(process.env.S3_ACCESS_KEY_ID),secretAccessKey:String(process.env.S3_SECRET_ACCESS_KEY)},forcePathStyle:String(process.env.S3_FORCE_PATH_STYLE??'true').toLowerCase()!=='false',requestChecksumCalculation:'WHEN_REQUIRED',responseChecksumValidation:'WHEN_REQUIRED'};if(process.env.S3_ENDPOINT)cfg.endpoint=String(process.env.S3_ENDPOINT);this.client=new mod.S3Client(cfg);
   }
-  ingest(headers,target){const list=typeof headers.getSetCookie==='function'?headers.getSetCookie():splitSetCookie(headers.get('set-cookie')||'');for(const h of list)this.set(h,target,false)}
-  valid(target,includeHttpOnly=true){const now=Date.now(),out=[];for(const [k,c]of this.map){if(c.expires!==null&&c.expires<=now){this.map.delete(k);continue}if(c.secure&&target.protocol!=='https:')continue;if(!domainMatch(target.hostname,c.domain,c.hostOnly)||!pathMatch(target.pathname,c.path))continue;if(!includeHttpOnly&&c.httpOnly)continue;out.push(c)}return out.sort((a,b)=>b.path.length-a.path.length)}
-  header(target){return this.valid(target,true).map(c=>c.name+'='+c.value).join('; ')}
-  document(target){return this.valid(target,false).map(c=>c.name+'='+c.value).join('; ')}
-  schedule(){clearTimeout(this.saveTimer);this.saveTimer=setTimeout(()=>this.save().catch(()=>{}),250);this.saveTimer.unref?.()}
-  async save(){await mkdir(DATA_DIR,{recursive:true});const tmp=COOKIE_FILE+'.tmp';await writeFile(tmp,JSON.stringify([...this.map.values()]));await rename(tmp,COOKIE_FILE)}
-}
-const jar=new CookieJar();await jar.load();
-
-function privateIp(host){
-  host=host.toLowerCase().replace(/^\[|\]$/g,'');
-  if(host.includes(':'))return host==='::'||host==='::1'||host.startsWith('fc')||host.startsWith('fd')||/^fe[89ab]/.test(host)||host.startsWith('::ffff:127.')||host.startsWith('::ffff:10.')||host.startsWith('::ffff:192.168.');
-  if(!/^\d{1,3}(\.\d{1,3}){3}$/.test(host))return false;const p=host.split('.').map(Number);if(p.some(x=>x>255))return true;const[a,b,c]=p;return a===0||a===10||a===127||(a===100&&b>=64&&b<=127)||(a===169&&b===254)||(a===172&&b>=16&&b<=31)||(a===192&&b===168)||(a===192&&b===0&&[0,2].includes(c))||(a===198&&[18,19].includes(b))||(a===198&&b===51&&c===100)||(a===203&&b===0&&c===113)||a>=224;
-}
-async function assertTarget(target,requestHost=''){
-  if(!['http:','https:','ws:','wss:'].includes(target.protocol))throw Error('Only HTTP, HTTPS, WS and WSS are supported');
-  if(target.username||target.password)throw Error('Credentials in target URL are not allowed');
-  const h=target.hostname.toLowerCase();if(h===requestHost||h==='localhost'||h.endsWith('.localhost')||h.endsWith('.local')||h.endsWith('.internal')||privateIp(h)){if(!ALLOW_PRIVATE_TEST)throw Error('Private and local destinations are blocked')}
-  if(!ALLOW_PRIVATE_TEST&&!privateIp(h)){const records=await lookup(h,{all:true,verbatim:true});if(!records.length||records.some(r=>privateIp(r.address)))throw Error('Destination resolved to a private address')}
-}
-function proxyPath(value){const u=value instanceof URL?value:new URL(value);return'/p/'+u.protocol.slice(0,-1)+'/'+encodeURIComponent(u.host)+(u.pathname||'/')+u.search+u.hash}
-function parseProxyPath(reqUrl){const parts=reqUrl.pathname.split('/');if(parts[1]!=='p'||!parts[2]||!parts[3])throw Error('Invalid proxy URL');const scheme=parts[2],host=decodeURIComponent(parts[3]),pathname='/'+parts.slice(4).join('/');return new URL(scheme+':'+'//'+host+(pathname||'/')+reqUrl.search)}
-function rewriteUrl(raw,target){if(!raw)return raw;const v=String(raw).trim();if(/^(#|data:|blob:|javascript:|mailto:|tel:|about:)/i.test(v))return raw;try{const u=new URL(v,target);return['http:','https:'].includes(u.protocol)?proxyPath(u):raw}catch{return raw}}
-function rewriteCss(css,target){return String(css).replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi,(m,q,v)=>'url('+q+rewriteUrl(v,target)+q+')').replace(/@import\s+(["'])(.*?)\1/gi,(m,q,v)=>'@import '+q+rewriteUrl(v,target)+q)}
-function escapeAttr(s){return String(s).replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;')}
-function bridgeScript(target,documentCookies){
-  const T=JSON.stringify(target.href).replaceAll('<','\\u003c'),C=JSON.stringify(documentCookies).replaceAll('<','\\u003c');
-  return`(()=>{const T=${T},P=location.origin,C=${C};const px=v=>{try{const u=new URL(String(v),T);if(!/^https?:$/.test(u.protocol))return v;if(u.origin===location.origin&&u.pathname.startsWith('/p/'))return v;return P+'/p/'+u.protocol.slice(0,-1)+'/'+encodeURIComponent(u.host)+u.pathname+u.search+u.hash}catch{return v}};const F=window.fetch.bind(window);window.fetch=(i,n)=>i instanceof Request?F(new Request(px(i.url),i),n):F(px(i),n);const O=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,...r){return O.call(this,m,px(u),...r)};const B=navigator.sendBeacon?.bind(navigator);if(B)navigator.sendBeacon=(u,d)=>B(px(u),d);const E=window.EventSource;if(E)window.EventSource=function(u,c){return new E(px(u),c)};const W=window.WebSocket;if(W)window.WebSocket=function(u,p){const x=new URL(String(u),T),q=(location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws?url='+encodeURIComponent(x.href);return new W(q,p)};window.WebSocket.prototype=W?.prototype;const N=window.open;window.open=(u,...r)=>N.call(window,px(u),...r);for(const k of['pushState','replaceState']){const n=history[k].bind(history);history[k]=(s,t,u)=>n(s,t,u==null?u:px(u))}const attrs=['href','src','action','poster','data','srcset'];const fix=e=>{if(!e?.getAttribute)return;for(const a of attrs){const v=e.getAttribute(a);if(v&&!v.startsWith('data:'))e.setAttribute(a,a==='srcset'?v.split(',').map(x=>{const z=x.trim().split(/\\s+/);z[0]=px(z[0]);return z.join(' ')}).join(', '):px(v))}};new MutationObserver(ms=>ms.forEach(m=>m.addedNodes.forEach(n=>{fix(n);n.querySelectorAll?.('[href],[src],[action],[poster],[data],[srcset]').forEach(fix)}))).observe(document,{subtree:true,childList:true});addEventListener('submit',e=>{if(e.target?.action)e.target.action=px(e.target.action)},true);try{const m=new Map(C.split(';').map(x=>x.trim().split(/=(.*)/s)).filter(x=>x[0]));Object.defineProperty(document,'cookie',{configurable:true,get(){return[...m].map(x=>x[0]+'='+x[1]).join('; ')},set(v){const a=String(v).split(';'),[k,...r]=a[0].split('=');if(k)m.set(k.trim(),r.join('='));navigator.sendBeacon('/api/cookie',new Blob([JSON.stringify({url:T,cookie:String(v)})],{type:'application/json'}))}})}catch{}try{parent.postMessage({type:'railway-proxy:navigation',url:T},location.origin)}catch{}})();`;
-}
-function rewriteHtml(html,target){
-  let out=String(html).replace(/<base\b[^>]*>/gi,'');
-  out=out.replace(/(\s(?:href|src|action|poster|data|cite|background)\s*=\s*)(["'])(.*?)\2/gi,(m,p,q,v)=>p+q+escapeAttr(rewriteUrl(v,target))+q);
-  out=out.replace(/(\s(?:href|src|action|poster|data|cite|background)\s*=\s*)([^\s"'=<>`]+)/gi,(m,p,v)=>p+escapeAttr(rewriteUrl(v,target)));
-  out=out.replace(/(\ssrcset\s*=\s*)(["'])(.*?)\2/gi,(m,p,q,v)=>p+q+v.split(',').map(x=>{const z=x.trim().split(/\s+/);z[0]=rewriteUrl(z[0],target);return z.join(' ')}).join(', ')+q);
-  out=out.replace(/(\sstyle\s*=\s*)(["'])(.*?)\2/gi,(m,p,q,v)=>p+q+escapeAttr(rewriteCss(v,target))+q);
-  out=out.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi,(m,a,c,z)=>a+rewriteCss(c,target)+z);
-  out=out.replace(/(<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*content=["'])([^"']*)(["'][^>]*>)/gi,(m,a,c,z)=>a+c.replace(/url\s*=\s*(.+)$/i,(x,v)=>'url='+rewriteUrl(v.trim(),target))+z);
-  const dir=new URL('.',target),inject='<base href="'+escapeAttr(proxyPath(dir))+'"><script>'+bridgeScript(target,jar.document(target))+'<\/script>';
-  return/<head\b[^>]*>/i.test(out)?out.replace(/<head\b[^>]*>/i,m=>m+inject):inject+out;
-}
-function responseHeaders(upstream,target,reqUrl){const h={};for(const[k,v]of upstream.headers){const n=k.toLowerCase();if(DROP_RESPONSE.has(n)||n.startsWith('access-control-'))continue;h[k]=v}h['cache-control']='no-store';h['referrer-policy']='no-referrer';const loc=upstream.headers.get('location');if(loc)h.location=rewriteUrl(loc,target);return h}
-async function proxyRequest(req,res,reqUrl){
-  if(!authed(req))return json(res,401,{error:'Unauthorized'});
-  const target=parseProxyPath(reqUrl);await assertTarget(target,(req.headers.host||'').split(':')[0]);
-  const headers=new Headers();for(const[k,v]of Object.entries(req.headers)){if(v==null||DROP_REQUEST.has(k)||k.startsWith('sec-fetch-'))continue;headers.set(k,Array.isArray(v)?v.join(', '):v)}
-  const c=jar.header(target);if(c)headers.set('cookie',c);if(req.headers.origin)headers.set('origin',target.origin);const referer=req.headers.referer;headers.set('referer',referer?.includes('/p/')?target.href:target.origin+'/');
-  const method=req.method||'GET',payload=['GET','HEAD'].includes(method)?undefined:await readBody(req);const upstream=await fetch(target,{method,headers,body:payload,redirect:'manual'});jar.ingest(upstream.headers,target);
-  const type=(upstream.headers.get('content-type')||'').toLowerCase(),headersOut=responseHeaders(upstream,target,reqUrl);
-  if(method==='HEAD'){res.writeHead(upstream.status,headersOut);return res.end()}
-  if(type.includes('text/html')||type.includes('application/xhtml+xml')){const text=rewriteHtml(await upstream.text(),target);headersOut['content-type']='text/html; charset=utf-8';res.writeHead(upstream.status,headersOut);return res.end(text)}
-  if(type.includes('text/css')){const text=rewriteCss(await upstream.text(),target);headersOut['content-type']='text/css; charset=utf-8';res.writeHead(upstream.status,headersOut);return res.end(text)}
-  if(type.includes('mpegurl')){const text=(await upstream.text()).split(/\r?\n/).map(x=>!x.trim()||x.trim().startsWith('#')?x:rewriteUrl(x.trim(),target)).join('\n');res.writeHead(upstream.status,headersOut);return res.end(text)}
-  res.writeHead(upstream.status,headersOut);if(upstream.body)Readable.fromWeb(upstream.body).pipe(res);else res.end();
+  summary(){let endpoint='AWS S3';try{if(process.env.S3_ENDPOINT)endpoint=new URL(process.env.S3_ENDPOINT).host}catch{}return{configured:this.configured,bucket:this.configured?String(process.env.S3_BUCKET):null,endpoint:this.configured?endpoint:null,mode:this.configured?'s3':'local'}}
+  publicRecord(r){return{id:r.id,name:r.name,size:r.size||0,status:r.status,location:r.location||null,key:r.key||null,createdAt:r.createdAt,updatedAt:r.updatedAt,sourceUrl:r.sourceUrl||'',tabTitle:r.tabTitle||'',error:r.error||null}}
+  list(){return this.records.map(r=>this.publicRecord(r))}
+  async persist(){await mkdir(DATA_DIR,{recursive:true});const tmp=DOWNLOAD_INDEX+'.tmp';await writeFile(tmp,JSON.stringify(this.records));await rename(tmp,DOWNLOAD_INDEX)}
+  notify(record){this.onChange?.({type:'download:update',download:this.publicRecord(record),storage:this.summary()})}
+  async capture(download,source={}){const id=randomUUID(),name=safeName(download.suggestedFilename()),now=new Date().toISOString(),record={id,name,size:0,status:'downloading',createdAt:now,updatedAt:now,sourceUrl:source.url||'',tabTitle:source.title||'',location:null,key:null,localPath:null,error:null};this.records.unshift(record);this.records=this.records.slice(0,500);await this.persist();this.notify(record);
+    const localPath=DOWNLOAD_DIR+'/'+id+'-'+name;
+    try{await download.saveAs(localPath);const failure=await download.failure();if(failure)throw Error(failure);const info=await stat(localPath);record.size=info.size;
+      if(this.configured){const day=new Date().toISOString().slice(0,10).replaceAll('-','/'),key=this.prefix+day+'/'+id+'-'+name;await this.client.send(new this.s3.PutObjectCommand({Bucket:String(process.env.S3_BUCKET),Key:key,Body:createReadStream(localPath),ContentLength:info.size,ContentType:contentType(name),ContentDisposition:"attachment; filename*=UTF-8''"+encodeURIComponent(name),Metadata:{'source-url':String(source.url||'').slice(0,1800)}}));await unlink(localPath).catch(()=>{});record.location='s3';record.key=key}else{record.location='local';record.localPath=localPath}
+      record.status='stored';record.updatedAt=new Date().toISOString();
+    }catch(e){record.status='failed';record.error=e.message;record.updatedAt=new Date().toISOString();await unlink(localPath).catch(()=>{})}
+    await this.persist();this.notify(record);
+  }
+  find(id){return this.records.find(r=>r.id===id)}
+  async accessUrl(id){const r=this.find(id);if(!r||r.status!=='stored')throw Error('Download not found');if(r.location==='local')return{url:'/api/downloads/'+encodeURIComponent(id)+'/file',expiresIn:null};const ttl=Math.max(60,Math.min(86400,Number(process.env.S3_SIGNED_URL_TTL||900)));const command=new this.s3.GetObjectCommand({Bucket:String(process.env.S3_BUCKET),Key:r.key,ResponseContentDisposition:"attachment; filename*=UTF-8''"+encodeURIComponent(r.name)});return{url:await this.signer(this.client,command,{expiresIn:ttl}),expiresIn:ttl}}
+  async remove(id){const i=this.records.findIndex(r=>r.id===id);if(i<0)throw Error('Download not found');const r=this.records[i];if(r.location==='s3'&&r.key){if(!this.configured)throw Error('S3 storage is not configured');await this.client.send(new this.s3.DeleteObjectCommand({Bucket:String(process.env.S3_BUCKET),Key:r.key}))};if(r.localPath)await unlink(r.localPath).catch(()=>{});this.records.splice(i,1);await this.persist();this.onChange?.({type:'download:removed',id,storage:this.summary()})}
 }
 
-const server=http.createServer(async(req,res)=>{try{
-  const u=new URL(req.url,base(req));
-  if(u.pathname==='/healthz')return json(res,200,{ok:true,cookies:jar.map.size});
-  if(u.pathname==='/api/status')return json(res,200,{configured:Boolean(TOKEN),authenticated:authed(req)});
-  if(u.pathname==='/api/login'&&req.method==='POST'){if(!TOKEN)return json(res,503,{error:'ACCESS_TOKEN is not configured'});const b=JSON.parse((await readBody(req,16384)).toString()||'{}');if(!safeEqual(b.token||'',TOKEN))return json(res,401,{error:'Invalid token'});return json(res,200,{ok:true},{'set-cookie':AUTH_COOKIE+'='+encodeURIComponent(authHash())+'; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200'})}
-  if(u.pathname==='/api/logout'&&req.method==='POST')return json(res,200,{ok:true},{'set-cookie':AUTH_COOKIE+'=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'});
-  if(u.pathname==='/api/cookie'&&req.method==='POST'){if(!authed(req))return json(res,401,{error:'Unauthorized'});const b=JSON.parse((await readBody(req,16384)).toString()||'{}'),t=new URL(b.url);await assertTarget(t);jar.set(b.cookie,t,true);res.writeHead(204);return res.end()}
-  if(u.pathname==='/api/exit-ip'){if(!authed(req))return json(res,401,{error:'Unauthorized'});try{const r=await fetch('https:'+'//api.ipify.org?format=json',{signal:AbortSignal.timeout(10000)});return json(res,200,{ok:true,...await r.json(),source:'Railway outbound'})}catch(e){return json(res,502,{error:e.message})}}
-  if(u.pathname.startsWith('/p/'))return await proxyRequest(req,res,u);
-  if((u.pathname==='/'||u.pathname==='/app')&&req.method==='GET'){const html=await readFile(INDEX);res.writeHead(200,{...securityHeaders,'content-type':'text/html; charset=utf-8','content-length':html.length});return res.end(html)}
-  res.writeHead(404,securityHeaders);res.end('Not found');
+function blockedHost(host){if(ALLOW_PRIVATE_TEST)return false;host=String(host||'').toLowerCase().replace(/^\[|\]$/g,'');if(['localhost','metadata.google.internal','instance-data.ec2.internal'].includes(host)||host.endsWith('.local')||host.endsWith('.internal'))return true;const type=net.isIP(host);if(type===6)return host==='::1'||host==='::'||host.startsWith('fc')||host.startsWith('fd')||/^fe[89ab]/.test(host);if(type===4){const p=host.split('.').map(Number),[a,b]=p;return a===0||a===10||a===127||(a===100&&b>=64&&b<=127)||(a===169&&b===254)||(a===172&&b>=16&&b<=31)||(a===192&&b===168)||a>=224}return false}
+function normalizeUrl(value){let v=String(value||'').trim();if(!v)return HOME_URL;if(!/^[a-z][a-z\d+.-]*:/i.test(v))v='https:'+'//'+v;const u=new URL(v);if(!['http:','https:'].includes(u.protocol)||blockedHost(u.hostname))throw Error('این آدرس مجاز نیست');return u.href}
+
+class BrowserHub{
+  constructor(downloads){this.downloads=downloads;this.context=null;this.records=new Map();this.pageIds=new WeakMap();this.activeId=null;this.clients=new Set();this.ready=false;this.captureToken=0}
+  broadcast(value){const data=JSON.stringify(value);for(const ws of this.clients)if(ws.readyState===WebSocket.OPEN)ws.send(data)}
+  state(){return{type:'state',ready:this.ready,activeId:this.activeId,tabs:[...this.records.values()].map(r=>({id:r.id,title:r.title||'تب جدید',url:r.url||'about:blank',active:r.id===this.activeId})),homeUrl:HOME_URL,storage:this.downloads.summary()}}
+  broadcastState(){this.broadcast(this.state())}
+  addClient(ws){this.clients.add(ws);ws.send(JSON.stringify(this.state()));ws.send(JSON.stringify({type:'downloads',items:this.downloads.list(),storage:this.downloads.summary()}));const r=this.active();if(r&&!r.page.isClosed())r.page.screenshot({type:'jpeg',quality:SCREEN_QUALITY}).then(buf=>{if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'frame',tabId:r.id,data:buf.toString('base64'),metadata:{initial:true}}))}).catch(()=>{});ws.on('close',()=>this.clients.delete(ws))}
+  async start(){await mkdir(PROFILE_DIR,{recursive:true});const launch={headless:true,viewport:{width:1440,height:900},locale:BROWSER_LOCALE,timezoneId:BROWSER_TIMEZONE,acceptDownloads:true,args:['--disable-dev-shm-usage','--no-sandbox','--disable-setuid-sandbox','--disable-background-networking','--disable-component-update','--host-resolver-rules=MAP metadata.google.internal ~NOTFOUND, MAP instance-data.ec2.internal ~NOTFOUND']};if(process.env.CHROMIUM_PATH)launch.executablePath=String(process.env.CHROMIUM_PATH);this.context=await chromium.launchPersistentContext(PROFILE_DIR,launch);this.context.setDefaultTimeout(30000);
+    await this.context.route('**/*',async route=>{try{const u=new URL(route.request().url());if(['http:','https:'].includes(u.protocol)&&blockedHost(u.hostname))return route.abort('blockedbyclient')}catch{}return route.continue()});
+    this.context.on('page',p=>this.ensure(p,true).catch(()=>{}));for(const p of this.context.pages())await this.ensure(p,false);if(!this.records.size)await this.newTab(HOME_URL);else{const first=[...this.records.values()].find(r=>r.url!=='about:blank')||[...this.records.values()][0];if(first.url==='about:blank'){await first.page.goto(normalizeUrl(HOME_URL),{waitUntil:'domcontentloaded'}).catch(()=>{});await this.update(first,false)}await this.activate(first.id)}this.ready=true;this.broadcastState()}
+  async ensure(page,activate=false){if(this.pageIds.has(page)){const id=this.pageIds.get(page);if(activate)await this.activate(id);return id}const id=randomUUID(),r={id,page,title:'تب جدید',url:page.url()||'about:blank',session:null};this.pageIds.set(page,id);this.records.set(id,r);const update=()=>this.update(r).catch(()=>{});page.on('framenavigated',f=>{if(f===page.mainFrame())update()});page.on('load',update);page.on('domcontentloaded',update);page.on('download',d=>this.downloads.capture(d,{url:page.url(),title:r.title}).catch(()=>{}));page.on('close',()=>this.closed(id));await this.update(r,false);if(activate)await this.activate(id);else this.broadcastState();return id}
+  async update(r,broadcast=true){if(r.page.isClosed())return;r.url=r.page.url()||'about:blank';r.title=(await r.page.title().catch(()=>''))||new URL(r.url==='about:blank'?'https://new-tab.invalid':r.url).hostname.replace('new-tab.invalid','تب جدید');if(broadcast)this.broadcastState()}
+  async closed(id){const wasActive=this.activeId===id;this.records.delete(id);if(!wasActive)return this.broadcastState();this.activeId=null;const next=[...this.records.values()][0];if(next)await this.activate(next.id);else if(this.context)await this.newTab(HOME_URL)}
+  async stopCapture(r){if(!r?.session)return;try{await r.session.send('Page.stopScreencast')}catch{}try{await r.session.detach()}catch{}r.session=null}
+  async startCapture(r){const token=++this.captureToken;await this.stopCapture(r);const session=await this.context.newCDPSession(r.page);r.session=session;session.on('Page.screencastFrame',async event=>{try{await session.send('Page.screencastFrameAck',{sessionId:event.sessionId})}catch{}if(token!==this.captureToken||this.activeId!==r.id)return;this.broadcast({type:'frame',tabId:r.id,data:event.data,metadata:event.metadata})});await session.send('Page.startScreencast',{format:'jpeg',quality:SCREEN_QUALITY,maxWidth:1440,maxHeight:900,everyNthFrame:1});try{const shot=await session.send('Page.captureScreenshot',{format:'jpeg',quality:SCREEN_QUALITY,fromSurface:true});if(token===this.captureToken&&this.activeId===r.id)this.broadcast({type:'frame',tabId:r.id,data:shot.data,metadata:{initial:true}})}catch{}}
+  async activate(id){const r=this.records.get(id);if(!r||r.page.isClosed())return;const old=this.records.get(this.activeId);if(old&&old!==r)await this.stopCapture(old);this.activeId=id;await r.page.bringToFront().catch(()=>{});await this.startCapture(r);await this.update(r,false);this.broadcastState()}
+  active(){return this.records.get(this.activeId)}
+  async newTab(url=HOME_URL){const page=await this.context.newPage(),id=await this.ensure(page,false);await this.activate(id);await page.goto(normalizeUrl(url),{waitUntil:'domcontentloaded'}).catch(()=>{});await this.update(this.records.get(id));return id}
+  async closeTab(id){const r=this.records.get(id);if(!r)return;if(this.records.size===1)return this.newTab(HOME_URL).then(()=>r.page.close());await r.page.close()}
+  async message(raw){const m=typeof raw==='string'?JSON.parse(raw):raw;if(m.type==='tab.new')return this.newTab(m.url||HOME_URL);if(m.type==='tab.activate')return this.activate(m.id);if(m.type==='tab.close')return this.closeTab(m.id);const r=this.active();if(!r)return;
+    if(m.type==='navigate'){await r.page.goto(normalizeUrl(m.url),{waitUntil:'domcontentloaded'}).catch(()=>{});return this.update(r)}
+    if(m.type==='back'){await r.page.goBack({waitUntil:'domcontentloaded'}).catch(()=>{});return this.update(r)}
+    if(m.type==='forward'){await r.page.goForward({waitUntil:'domcontentloaded'}).catch(()=>{});return this.update(r)}
+    if(m.type==='reload'){await r.page.reload({waitUntil:'domcontentloaded'}).catch(()=>{});return this.update(r)}
+    if(m.type==='home'){await r.page.goto(HOME_URL,{waitUntil:'domcontentloaded'}).catch(()=>{});return this.update(r)}
+    if(m.type==='mouse'){if(m.action==='move')return r.page.mouse.move(Number(m.x),Number(m.y));if(m.action==='click')return r.page.mouse.click(Number(m.x),Number(m.y),{button:m.button||'left',clickCount:Number(m.clickCount||1)});if(m.action==='wheel')return r.page.mouse.wheel(Number(m.dx||0),Number(m.dy||0))}
+    if(m.type==='text')return r.page.keyboard.insertText(String(m.text||''));if(m.type==='key'){const key=String(m.key||'');if(!key)return;if(m.action==='up')return r.page.keyboard.up(key).catch(()=>{});return r.page.keyboard.down(key).catch(()=>{})}
+  }
+  async close(){this.captureToken++;for(const r of this.records.values())await this.stopCapture(r);await this.context?.close()}
+}
+
+let hub;const downloads=new DownloadStore(event=>hub?.broadcast(event));hub=new BrowserHub(downloads);await downloads.init();
+
+const server=http.createServer(async(req,res)=>{try{const u=new URL(req.url,requestBase(req));
+  if(u.pathname==='/healthz')return json(res,hub.ready?200:503,{ok:hub.ready,browserReady:hub.ready,storageConfigured:downloads.configured});
+  if(u.pathname==='/api/status')return json(res,200,{configured:Boolean(ACCESS_TOKEN),authenticated:authenticated(req),browserReady:hub.ready,storage:authenticated(req)?downloads.summary():undefined});
+  if(u.pathname==='/api/login'&&req.method==='POST'){if(!ACCESS_TOKEN)return json(res,503,{error:'ACCESS_TOKEN تنظیم نشده است'});const b=JSON.parse((await readBody(req,16384)).toString()||'{}');if(!safeEqual(b.token||'',ACCESS_TOKEN))return json(res,401,{error:'توکن نادرست ��ست'});return json(res,200,{ok:true},{'set-cookie':cookie(sessionValue(),43200)})}
+  if(u.pathname==='/api/logout'&&req.method==='POST')return json(res,200,{ok:true},{'set-cookie':cookie('',0)});
+  if(u.pathname==='/api/exit-ip'){if(!authenticated(req))return json(res,401,{error:'Unauthorized'});try{const r=await fetch('https:'+'//api.ipify.org?format=json',{signal:AbortSignal.timeout(10000)});return json(res,200,{ok:true,...await r.json()})}catch(e){return json(res,502,{error:e.message})}}
+  if(u.pathname==='/api/downloads'&&req.method==='GET'){if(!authenticated(req))return json(res,401,{error:'Unauthorized'});return json(res,200,{items:downloads.list(),storage:downloads.summary()})}
+  const urlMatch=u.pathname.match(/^\/api\/downloads\/([^/]+)\/url$/);if(urlMatch&&req.method==='POST'){if(!authenticated(req))return json(res,401,{error:'Unauthorized'});return json(res,200,await downloads.accessUrl(decodeURIComponent(urlMatch[1])))}
+  const fileMatch=u.pathname.match(/^\/api\/downloads\/([^/]+)\/file$/);if(fileMatch&&req.method==='GET'){if(!authenticated(req))return json(res,401,{error:'Unauthorized'});const r=downloads.find(decodeURIComponent(fileMatch[1]));if(!r||r.location!=='local'||!r.localPath)return json(res,404,{error:'Not found'});const s=await stat(r.localPath);res.writeHead(200,{'content-type':contentType(r.name),'content-length':s.size,'content-disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(r.name),'cache-control':'private, no-store'});return createReadStream(r.localPath).pipe(res)}
+  const delMatch=u.pathname.match(/^\/api\/downloads\/([^/]+)$/);if(delMatch&&req.method==='DELETE'){if(!authenticated(req))return json(res,401,{error:'Unauthorized'});await downloads.remove(decodeURIComponent(delMatch[1]));res.writeHead(204);return res.end()}
+  if((u.pathname==='/'||u.pathname==='/app')&&req.method==='GET'){const body=await readFile(INDEX_PATH);res.writeHead(200,{...publicHeaders,'content-type':'text/html; charset=utf-8','content-length':body.length});return res.end(body)}
+  res.writeHead(404,publicHeaders);res.end('Not found');
 }catch(e){json(res,500,{error:e.message})}});
 
-const wss=new WebSocketServer({noServer:true,maxPayload:16*1024*1024});
-server.on('upgrade',async(req,socket,head)=>{try{const u=new URL(req.url,base(req));if(u.pathname!=='/ws'||!authed(req))throw Error('Unauthorized');const target=new URL(u.searchParams.get('url')||'');if(!['ws:','wss:'].includes(target.protocol))throw Error('Invalid WebSocket target');await assertTarget(target,(req.headers.host||'').split(':')[0]);wss.handleUpgrade(req,socket,head,client=>wss.emit('connection',client,req,target))}catch(e){socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');socket.destroy()}});
-wss.on('connection',(client,req,target)=>{const httpTarget=new URL(target.href.replace(/^ws/,'http')),cookie=jar.header(httpTarget);const upstream=new WebSocket(target,{headers:{origin:httpTarget.origin,'user-agent':req.headers['user-agent']||'Mozilla/5.0',...(cookie?{cookie}:{})}});const queue=[];client.on('message',(d,b)=>upstream.readyState===WebSocket.OPEN?upstream.send(d,{binary:b}):queue.push([d,b]));upstream.on('open',()=>queue.splice(0).forEach(([d,b])=>upstream.send(d,{binary:b})));upstream.on('message',(d,b)=>client.readyState===WebSocket.OPEN&&client.send(d,{binary:b}));const close=()=>{client.close();upstream.close()};client.on('close',()=>upstream.close());upstream.on('close',()=>client.close());client.on('error',close);upstream.on('error',close)});
-server.listen(PORT,'0.0.0.0',()=>console.log('Railway web proxy listening on '+PORT));
-for(const sig of['SIGTERM','SIGINT'])process.on(sig,async()=>{await jar.save().catch(()=>{});server.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref()});
+const wss=new WebSocketServer({noServer:true,maxPayload:1024*1024});
+server.on('upgrade',(req,socket,head)=>{
+  try{
+    const u=new URL(req.url,requestBase(req));
+    if(u.pathname!=='/ws'||!authenticated(req))throw Error('Unauthorized');
+    wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws,req));
+  }catch{
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+  }
+});
+wss.on('connection',ws=>{
+  hub.addClient(ws);
+  ws.on('message',data=>{
+    hub.message(data.toString()).catch(e=>{
+      if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'error',message:e.message}));
+    });
+  });
+});
+server.listen(PORT,'0.0.0.0',()=>console.log('Railway browser listening on '+PORT));hub.start().catch(e=>{console.error(e);setTimeout(()=>process.exit(1),1000).unref()});
+for(const sig of['SIGTERM','SIGINT'])process.on(sig,async()=>{await hub.close().catch(()=>{});server.close(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref()});
