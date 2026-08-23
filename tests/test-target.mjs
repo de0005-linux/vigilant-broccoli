@@ -1,9 +1,4 @@
 import http from 'node:http';
-const file=Buffer.from('railway-browser-download-ok\n');
-const server=http.createServer((req,res)=>{
-  if(req.url==='/'){res.writeHead(200,{'content-type':'text/html; charset=utf-8'});return res.end('<!doctype html><title>Test Home</title><h1>Test Home</h1><a href="/page2" target="_blank">Open tab</a><a href="/download">Download</a>')}
-  if(req.url==='/page2'){res.writeHead(200,{'content-type':'text/html; charset=utf-8'});return res.end('<!doctype html><title>Page Two</title><h1>Second tab</h1>')}
-  if(req.url==='/download'){res.writeHead(200,{'content-type':'text/plain','content-length':file.length,'content-disposition':'attachment; filename="test-download.txt"'});return res.end(file)}
-  res.writeHead(404);res.end('not found');
-});
-server.listen(3344,'127.0.0.1',()=>console.log('browser target ready'));
+const file=Buffer.from('fixed-browser-download-ok\n');
+const page=`<!doctype html><html><head><title>Visible Frame Test</title><style>body{margin:0;font-family:Arial;background:#113355;color:white}.hero{height:340px;background:linear-gradient(135deg,#113355,#2783de);padding:70px}.hero h1{font-size:64px;margin:0}.hero p{font-size:28px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;padding:40px;background:#f7f7f5}.card{height:220px;border-radius:14px}.a{background:#46a171}.b{background:#d5803b}.c{background:#e56458}</style></head><body><section class="hero"><h1>VISIBLE PAGE</h1><p>This frame must not be blank.</p></section><section class="grid"><div class="card a"></div><div class="card b"></div><div class="card c"></div></section></body></html>`;
+const server=http.createServer((req,res)=>{if(req.url==='/'){res.writeHead(200,{'content-type':'text/html; charset=utf-8'});return res.end(page)}if(req.url==='/download'){res.writeHead(200,{'content-type':'text/plain','content-length':file.length,'content-disposition':'attachment; filename="fixed.txt"'});return res.end(file)}res.writeHead(404);res.end('not found')});server.listen(3346,'127.0.0.1',()=>console.log('fixed target ready'));

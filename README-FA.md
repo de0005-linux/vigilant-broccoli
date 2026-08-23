@@ -1,136 +1,72 @@
-# مرورگر Railway با چند تب و S3
+# Railway Browser v4 — اصلاح صفحه سفید
 
-این پروژه نسخه توسعه‌یافته مرورگر راه‌دور Railway است. Chromium واقعی روی Railway اجرا می‌شود، تصویر تب فعال با CDP Screencast به رابط وب فرستاده می‌شود و ورودی موس و صفحه‌کلید از مرورگر کاربر به Chromium منتقل می‌شود.
+این نسخه مشکل صفحه سفید را برطرف می‌کند.
 
-## قابلیت‌های جدید
+## علت اصلی
 
-- مدیریت چند تب: ایجاد، فعال‌سازی، بستن و نگهداری وضعیت هر تب
-- Popupهای سایت به‌صورت تب جدید
-- نوار تب واکنش‌گرا برای دسکتاپ و موبایل
-- دریافت فایل توسط Chromium
-- انتقال خودکار فایل دانلودشده به هر Bucket سازگار با S3
-- فهرست دانلودها، دریافت با Signed URL و حذف Object از Bucket
-- نگهداری موقت محلی روی Railway Volume در صورت تنظیم‌نبودن S3
+رابط قبلی برای تبدیل فریم Base64 به تصویر از این الگو استفاده می‌کرد:
 
-## Deploy روی Railway
-
-1. محتویات ZIP را در GitHub Repository قرار بده.
-2. در Railway گزینه **Deploy from GitHub Repo** را انتخاب کن.
-3. این Variable اجباری را اضافه کن:
-
-```dotenv
-ACCESS_TOKEN=یک-رمز-طولانی-و-تصادفی
+```js
+fetch('data:image/jpeg;base64,...')
 ```
 
-4. یک Railway Volume روی مسیر زیر Mount کن:
+اما Content Security Policy اتصال `data:` را در `connect-src` مجاز نمی‌کرد. در نتیجه فریم به سرور می‌رسید ولی مرورگر رابط اجازه Decode آن را نمی‌داد و Canvas سفید باقی می‌ماند.
 
-```text
-/data
-```
+نسخه جدید مستقیماً از Data URL به‌عنوان منبع Image استفاده می‌کند، Snapshot اجباری بعد از Navigation می‌فرستد و اگر بیش از ۶ ثانیه فریمی دریافت نشود به‌صورت خودکار Snapshot جدید درخواست می‌کند.
 
-5. در Networking یک Railway Domain یا Custom Domain ایجاد کن.
-6. سرویس را با **یک Replica** اجرا کن؛ تب‌ها و پروفایل Chromium برای یک نشست مشترک طراحی شده‌اند.
+## اصلاحات
 
-## تنظیم S3-compatible Bucket
+- Decode مستقیم JPEG بدون `fetch(data:)`
+- Snapshot بعد از اتصال، Navigation، Reload، تغییر تب و Load
+- بازیابی خودکار تصویر در صورت توقف Screencast
+- تست واقعی محتوای پیکسلی فریم، نه فقط دریافت پیام WebSocket
+- S3 Fail-safe: خطای تنظیمات یا SDK دیگر سرویس را Crash نمی‌کند
+- افزودن خودکار `https://` به Endpointهایی مثل IDrive e2
+- اگر آپلود S3 شکست بخورد، فایل روی Railway Volume باقی می‌ماند
+- مدیریت چند تب و دانلودها حفظ شده است
 
-متغیرهای زیر را در Railway اضافه کن:
+## تنظیمات IDrive e2
 
 ```dotenv
-S3_ENDPOINT=https://YOUR-S3-ENDPOINT
-S3_REGION=auto
-S3_BUCKET=browser-downloads
-S3_ACCESS_KEY_ID=YOUR_ACCESS_KEY
-S3_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
+S3_ENDPOINT=https://s3.us-west-2.idrivee2.com
+S3_REGION=us-west-2
+S3_BUCKET=bt2
+S3_ACCESS_KEY_ID=YOUR_REAL_ACCESS_KEY
+S3_SECRET_ACCESS_KEY=YOUR_REAL_SECRET_KEY
 S3_FORCE_PATH_STYLE=true
 S3_PREFIX=browser-downloads
 S3_SIGNED_URL_TTL=900
 ```
 
-### Cloudflare R2
+حتی اگر Endpoint را بدون `https://` وارد کنی، نسخه جدید آن را اصلاح می‌کند؛ بااین‌حال URL کامل توصیه می‌شود.
+
+## متغیرهای اصلی Railway
 
 ```dotenv
-S3_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
-S3_REGION=auto
-S3_FORCE_PATH_STYLE=true
-```
-
-### AWS S3
-
-برای AWS اصلی می‌توانی `S3_ENDPOINT` را حذف کنی و Region واقعی را قرار بدهی:
-
-```dotenv
-S3_REGION=eu-central-1
-S3_FORCE_PATH_STYLE=false
-```
-
-همین تنظیمات با سرویس‌هایی مثل MinIO، Backblaze B2 S3 API، Wasabi و DigitalOcean Spaces نیز قابل استفاده است.
-
-## جریان دانلود
-
-1. Chromium فایل را در مسیر موقت `/data/downloads` دریافت می‌کند.
-2. فایل با اندازه و Content-Type صحیح داخل Bucket آپلود می‌شود.
-3. بعد از آپلود موفق، نسخه محلی حذف می‌شود.
-4. اطلاعات دانلود در `/data/download-index.json` نگهداری می‌شود.
-5. دکمه دریافت یک Signed URL موقت تولید می‌کند.
-6. حذف فایل، Object را از Bucket هم حذف می‌کند.
-
-اگر S3 تنظیم نشده باشد، فایل روی Railway Volume باقی می‌ماند و از همان پنل قابل دریافت است.
-
-## سایر متغیرها
-
-```dotenv
-PORT=3000
-PROFILE_DIR=/data/chromium-profile
+ACCESS_TOKEN=YOUR_LONG_RANDOM_TOKEN
 DATA_DIR=/data
+PROFILE_DIR=/data/chromium-profile
 HOME_URL=https://example.com
-BROWSER_LOCALE=fa-IR
-BROWSER_TIMEZONE=Asia/Tehran
+BROWSER_HEADLESS=true
+IGNORE_HTTPS_ERRORS=true
+MAX_TABS=8
+NAVIGATION_TIMEOUT_MS=45000
 SCREEN_QUALITY=72
-S3_SIGNED_URL_TTL=900
+SECURE_COOKIE=true
 ```
 
-برای تست محلی روی HTTP:
+یک Railway Volume روی `/data` Mount کن و سرویس را با یک Replica اجرا کن.
 
-```dotenv
-SECURE_COOKIE=false
-CHROMIUM_PATH=/usr/bin/chromium
-```
+## S3 Fail-safe
 
-در Railway مقدار پیش‌فرض `SECURE_COOKIE=true` را تغییر نده. متغیر `ALLOW_PRIVATE_TEST=true` فقط در تست خودکار با یک سایت محلی استفاده می‌شود و نباید روی Railway فعال شود.
+اگر S3 ناقص یا غیرقابل دسترس باشد:
 
-## IP خروجی
-
-سایت‌ها IP خروجی خود Railway را مشاهده می‌کنند. در صورت نیاز به IP پایدارتر، Static Outbound IPs را در Railway فعال و سرویس را Redeploy کن.
-
-## امنیت
-
-- سرویس بدون `ACCESS_TOKEN` قابل استفاده نیست.
-- کلیدهای S3 فقط در Railway Variables قرار می‌گیرند و به مرورگر کاربر ارسال نمی‌شوند.
-- دریافت فایل با Signed URL موقت انجام می‌شود.
-- دسترسی مستقیم به localhost، شبکه خصوصی و Metadata endpointهای شناخته‌شده مسدود است.
-- فایل `download-index.json` شامل کلید Object است اما شامل Secretهای S3 نیست.
-- Bucket را Private نگه دار.
+1. HTTP Server و Chromium همچنان بالا می‌آیند.
+2. Health Check موفق می‌ماند.
+3. پنل وضعیت خطای S3 را نشان می‌دهد.
+4. دانلودها روی `/data/downloads` ذخیره می‌شوند.
+5. بعد از اصلاح S3 و Redeploy، آپلود ابری دوباره فعال می‌شود.
 
 ## محدودیت‌ها
 
-- این نسخه برای یک کاربر یا یک نشست مشترک و یک Replica ساخته شده است.
-- CAPTCHA، Passkey/WebAuthn، DRM و تشخیص دیتاسنتر ممکن است محدودیت داشته باشند.
-- در حالت HA یا چند Replica باید State تب‌ها، دانلودها و Profile بین Replicaها هماهنگ شود.
-
-## اجرای محلی
-
-```bash
-npm install
-ACCESS_TOKEN='test-token-long-enough' \
-SECURE_COOKIE=false \
-CHROMIUM_PATH=/usr/bin/chromium \
-PROFILE_DIR=./data/profile \
-DATA_DIR=./data \
-npm start
-```
-
-## Health Check
-
-```text
-GET /healthz
-```
+CAPTCHA، DRM، Passkey و تشخیص IP دیتاسنتر همچنان ممکن است توسط سایت مقصد محدود شوند؛ اما این موارد نباید باعث سفیدماندن تمام Canvas شوند.
