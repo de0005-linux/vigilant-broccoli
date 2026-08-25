@@ -5,6 +5,6 @@ COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY server.mjs ./
 COPY public ./public
-RUN mkdir -p /data/chromium-profile /data/downloads
+RUN mkdir -p /data/chromium-profile /data/downloads /data/uploads
 EXPOSE 3000
 CMD ["node","server.mjs"]
